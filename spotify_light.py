@@ -43,10 +43,19 @@ VISUALIZER_REFRESH_MS = 33     # ~30 FPS only while CAVA is enabled
 CAVA_BARS = 34
 CAVA_ASCII_MAX = 1000
 
-# Keep the same clean violet-to-magenta styling, but let CAVA handle all DSP.
-SPECTRUM_GRADIENT_START = "#4c1d95"
-SPECTRUM_GRADIENT_MID = "#7c3aed"
-SPECTRUM_GRADIENT_END = "#c026d3"
+# Seven lightweight three-stop color schemes. Each scheme keeps a subtle
+# gradient across the bars; changing schemes only swaps precomputed colors and
+# does not restart CAVA or add any audio-processing work.
+DEFAULT_COLOR_SCHEME = "Violet → Magenta"
+COLOR_SCHEMES = {
+    "Violet → Magenta": ("#4c1d95", "#7c3aed", "#c026d3"),
+    "Deep Blue → Cyan": ("#1e3a8a", "#2563eb", "#06b6d4"),
+    "Purple → Blue": ("#6d28d9", "#4f46e5", "#2563eb"),
+    "Red → Orange": ("#991b1b", "#dc2626", "#f97316"),
+    "Green → Aqua": ("#166534", "#16a34a", "#14b8a6"),
+    "Pink → Purple": ("#be185d", "#ec4899", "#8b5cf6"),
+    "Ice Blue → White": ("#0e7490", "#67e8f9", "#f8fafc"),
+}
 
 CAVA_CONFIG_DIR = os.path.join(
     os.path.expanduser("~"),
@@ -101,23 +110,30 @@ def lerp_color(start, end, amount):
     return rgb_to_hex(rgb)
 
 
-def spectrum_gradient(index, count):
+def three_stop_gradient(colors, count):
+    start, middle, end = colors
+
     if count <= 1:
-        return SPECTRUM_GRADIENT_MID
+        return [middle]
 
-    position = index / (count - 1)
-    if position <= 0.5:
-        return lerp_color(
-            SPECTRUM_GRADIENT_START,
-            SPECTRUM_GRADIENT_MID,
-            position / 0.5,
-        )
+    gradient = []
+    for index in range(count):
+        position = index / (count - 1)
+        if position <= 0.5:
+            color = lerp_color(
+                start,
+                middle,
+                position / 0.5,
+            )
+        else:
+            color = lerp_color(
+                middle,
+                end,
+                (position - 0.5) / 0.5,
+            )
+        gradient.append(color)
 
-    return lerp_color(
-        SPECTRUM_GRADIENT_MID,
-        SPECTRUM_GRADIENT_END,
-        (position - 0.5) / 0.5,
-    )
+    return gradient
 
 
 
@@ -314,10 +330,15 @@ class SpotifyLight(tk.Tk):
         self.visualizer_available = True
         self.cava_values = [0.0] * CAVA_BARS
         self.cava_display_values = [0.0] * CAVA_BARS
-        self.cava_colors = [
-            spectrum_gradient(index, CAVA_BARS)
-            for index in range(CAVA_BARS)
-        ]
+
+        # Precompute every palette once. The dropdown therefore adds virtually
+        # no runtime cost, even while CAVA is drawing at full speed.
+        self.cava_palette_cache = {
+            name: three_stop_gradient(colors, CAVA_BARS)
+            for name, colors in COLOR_SCHEMES.items()
+        }
+        self.color_scheme_name = DEFAULT_COLOR_SCHEME
+        self.cava_colors = self.cava_palette_cache[self.color_scheme_name]
 
         self.protocol("WM_DELETE_WINDOW", self.close_app)
 
@@ -377,6 +398,41 @@ class SpotifyLight(tk.Tk):
         self.visualizer_button.pack(
             side="left",
             padx=(16, 0),
+        )
+
+        self.color_scheme_var = tk.StringVar(
+            value=self.color_scheme_name
+        )
+        self.color_menu = tk.OptionMenu(
+            top_right,
+            self.color_scheme_var,
+            *COLOR_SCHEMES.keys(),
+            command=self.apply_color_scheme,
+        )
+        self.color_menu.config(
+            bg=BG,
+            fg=MUTED,
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=TEXT,
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+            cursor="hand2",
+            font=("Sans", 9, "bold"),
+            width=17,
+            anchor="e",
+        )
+        self.color_menu["menu"].config(
+            bg=BUTTON_BG,
+            fg=TEXT,
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=TEXT,
+            bd=0,
+            font=("Sans", 9),
+        )
+        self.color_menu.pack(
+            side="left",
+            padx=(12, 0),
         )
 
         self.fullscreen_button = tk.Button(
@@ -952,6 +1008,22 @@ class SpotifyLight(tk.Tk):
     # ==================================================
     # CAVA VISUALIZER
     # ==================================================
+
+    def apply_color_scheme(self, scheme_name=None):
+        if scheme_name not in self.cava_palette_cache:
+            scheme_name = DEFAULT_COLOR_SCHEME
+
+        self.color_scheme_name = scheme_name
+        self.color_scheme_var.set(scheme_name)
+        self.cava_colors = self.cava_palette_cache[scheme_name]
+
+        # Update the existing canvas rectangles in place. This works whether
+        # the visualizer is on or off and never requires a CAVA restart.
+        for index, bar in enumerate(self.cava_bars):
+            self.visualizer_canvas.itemconfig(
+                bar,
+                fill=self.cava_colors[index],
+            )
 
     def update_visualizer_button(self):
         if not self.visualizer_available:
