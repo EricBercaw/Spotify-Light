@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 
-import array
 import io
-import json
-import math
 import os
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
@@ -37,33 +33,29 @@ ART_SIZE = 360
 REFRESH_MS = 1500
 PROGRESS_REFRESH_MS = 200
 
-# Lightweight almost-live waveform settings. The analyzer is completely
-# stopped when the visual is disabled, so OFF adds no ongoing workload.
-WAVEFORM_HEIGHT = 162
-WAVEFORM_POINTS = 96
-WAVEFORM_REFRESH_MS = 40       # ~25 FPS; slightly calmer than the old ~30 FPS
-WAVEFORM_SAMPLE_RATE = 22050
-WAVEFORM_READ_BYTES = 1536     # ~35 ms of mono 16-bit audio at 22.05 kHz
+# CAVA-backed visualizer. OFF is always the startup/base-case mode.
+# When OFF there is no CAVA process, no audio analysis, and no redraw loop.
+VISUALIZER_HEIGHT = 162
+VISUALIZER_REFRESH_MS = 33     # ~30 FPS only while CAVA is enabled
+CAVA_BARS = 34
+CAVA_ASCII_MAX = 1000
 
-# Deep-violet waveform styling. The glow is just a second Canvas line using
-# the same coordinates, so the visual treatment adds essentially no analysis cost.
-WAVEFORM_BASELINE = "#24162f"
-WAVEFORM_GLOW = "#4c1d95"
-WAVEFORM_CORE = "#7c3aed"
-WAVEFORM_GLOW_WIDTH = 6
-WAVEFORM_CORE_WIDTH = 2
-WAVEFORM_SPLINE_STEPS = 18
+# Keep the same clean violet-to-magenta styling, but let CAVA handle all DSP.
+SPECTRUM_GRADIENT_START = "#4c1d95"
+SPECTRUM_GRADIENT_MID = "#7c3aed"
+SPECTRUM_GRADIENT_END = "#c026d3"
 
-CONFIG_DIR = os.path.join(
+CAVA_CONFIG_DIR = os.path.join(
     os.path.expanduser("~"),
     ".config",
     "spotify-light",
 )
-SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+CAVA_CONFIG_FILE = os.path.join(CAVA_CONFIG_DIR, "cava.conf")
+
 
 
 # ==================================================
-# COMMAND / SETTINGS HELPERS
+# COMMAND HELPERS
 # ==================================================
 
 
@@ -85,6 +77,59 @@ def run_command(args, timeout=2):
 
     except Exception:
         return ""
+
+
+def hex_to_rgb(value):
+    value = value.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb_to_hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+def lerp_color(start, end, amount):
+    start_rgb = hex_to_rgb(start)
+    end_rgb = hex_to_rgb(end)
+    rgb = tuple(
+        round(a + (b - a) * amount)
+        for a, b in zip(start_rgb, end_rgb)
+    )
+    return rgb_to_hex(rgb)
+
+
+def spectrum_gradient(index, count):
+    if count <= 1:
+        return SPECTRUM_GRADIENT_MID
+
+    position = index / (count - 1)
+    if position <= 0.5:
+        return lerp_color(
+            SPECTRUM_GRADIENT_START,
+            SPECTRUM_GRADIENT_MID,
+            position / 0.5,
+        )
+
+    return lerp_color(
+        SPECTRUM_GRADIENT_MID,
+        SPECTRUM_GRADIENT_END,
+        (position - 0.5) / 0.5,
+    )
+
+
+
+def find_cava():
+    candidates = [
+        shutil.which("cava"),
+        "/usr/bin/cava",
+        "/usr/local/bin/cava",
+    ]
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+
+    return None
 
 
 def spotifyd_running():
@@ -141,33 +186,6 @@ def playerctl(player, *args):
             *args,
         ]
     )
-
-
-def load_settings():
-    defaults = {
-        "waveform_enabled": False,
-    }
-
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as handle:
-            saved = json.load(handle)
-
-        if isinstance(saved, dict):
-            defaults.update(saved)
-
-    except Exception:
-        pass
-
-    return defaults
-
-
-def save_settings(settings):
-    try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as handle:
-            json.dump(settings, handle, indent=2)
-    except Exception:
-        pass
 
 
 def parse_playerctl_metadata(raw):
@@ -278,29 +296,28 @@ class SpotifyLight(tk.Tk):
 
         self.dragging_volume = False
 
-        # Always start with the waveform OFF. The user can enable it for the
-        # current session with the toggle, but reopening Spotify Light starts
-        # from the lowest-power state again.
-        self.waveform_enabled = False
-        self.waveform_process = None
-        self.waveform_thread = None
-        self.waveform_stop = threading.Event()
-        self.waveform_values = [0.0] * WAVEFORM_POINTS
-        self.waveform_last_audio = 0.0
-        self.waveform_monitor = ""
-        self.waveform_available = True
+        # Always start with the CAVA visualizer OFF. Turning it on starts
+        # exactly one CAVA raw-output process; turning it off terminates it.
+        self.visualizer_enabled = False
+        self.cava_process = None
+        self.cava_thread = None
+        self.cava_stop = threading.Event()
+        self.visualizer_draw_after = None
+        self.visualizer_available = True
+        self.cava_values = [0.0] * CAVA_BARS
+        self.cava_display_values = [0.0] * CAVA_BARS
+        self.cava_colors = [
+            spectrum_gradient(index, CAVA_BARS)
+            for index in range(CAVA_BARS)
+        ]
 
         self.protocol("WM_DELETE_WINDOW", self.close_app)
 
         self.build_ui()
         self.start_spotifyd()
 
-        if self.waveform_enabled:
-            self.after(1000, self.start_waveform)
-
         self.after(700, self.refresh_metadata)
         self.after(PROGRESS_REFRESH_MS, self.update_progress)
-        self.after(WAVEFORM_REFRESH_MS, self.draw_waveform)
 
     # ==================================================
     # UI
@@ -334,9 +351,10 @@ class SpotifyLight(tk.Tk):
         )
         self.connection_label.pack(side="left")
 
-        self.waveform_button = tk.Button(
+        self.visualizer_button = tk.Button(
             top_right,
-            command=self.toggle_waveform,
+            text="VISUALIZER: OFF",
+            command=self.toggle_visualizer,
             bg=BG,
             fg=MUTED,
             activebackground=BG,
@@ -348,11 +366,10 @@ class SpotifyLight(tk.Tk):
             cursor="hand2",
             font=("Sans", 9, "bold"),
         )
-        self.waveform_button.pack(
+        self.visualizer_button.pack(
             side="left",
             padx=(16, 0),
         )
-        self.update_waveform_button()
 
         body = tk.Frame(self, bg=BG)
         body.pack(
@@ -468,68 +485,38 @@ class SpotifyLight(tk.Tk):
         )
 
         # ==============================================
-        # LIGHTWEIGHT ALMOST-LIVE WAVEFORM
+        # CAVA VISUALIZER
         # ==============================================
 
-        # The visual belongs to the root window rather than the metadata
-        # column so it can span nearly the full app width. Its vertical
-        # position is calculated from the live gap between SOURCE and the
-        # playback time row, keeping it centered a little higher in that space.
-        self.waveform_container = tk.Frame(
+        # CAVA handles capture, FFT, autosensitivity and smoothing. Spotify
+        # Light only draws the raw bar values, which keeps this code simple.
+        self.visualizer_container = tk.Frame(
             self,
-            height=WAVEFORM_HEIGHT,
+            height=VISUALIZER_HEIGHT,
             bg=BG,
         )
-        self.waveform_container.pack_propagate(False)
+        self.visualizer_container.pack_propagate(False)
 
-        self.waveform_canvas = tk.Canvas(
-            self.waveform_container,
-            height=WAVEFORM_HEIGHT,
+        self.visualizer_canvas = tk.Canvas(
+            self.visualizer_container,
+            height=VISUALIZER_HEIGHT,
             bg=BG,
             highlightthickness=0,
         )
-        self.waveform_canvas.pack(fill="both", expand=True)
+        self.visualizer_canvas.pack(fill="both", expand=True)
 
-        self.waveform_center = self.waveform_canvas.create_line(
-            0,
-            WAVEFORM_HEIGHT / 2,
-            1,
-            WAVEFORM_HEIGHT / 2,
-            fill=WAVEFORM_BASELINE,
-            width=1,
-        )
-
-        # One dim wide line plus one crisp violet core gives a smooth glow
-        # without blur filters, extra images, or a heavier rendering library.
-        self.waveform_glow = self.waveform_canvas.create_line(
-            0,
-            WAVEFORM_HEIGHT / 2,
-            1,
-            WAVEFORM_HEIGHT / 2,
-            fill=WAVEFORM_GLOW,
-            width=WAVEFORM_GLOW_WIDTH,
-            smooth=True,
-            splinesteps=WAVEFORM_SPLINE_STEPS,
-            capstyle=tk.ROUND,
-            joinstyle=tk.ROUND,
-        )
-
-        self.waveform_line = self.waveform_canvas.create_line(
-            0,
-            WAVEFORM_HEIGHT / 2,
-            1,
-            WAVEFORM_HEIGHT / 2,
-            fill=WAVEFORM_CORE,
-            width=WAVEFORM_CORE_WIDTH,
-            smooth=True,
-            splinesteps=WAVEFORM_SPLINE_STEPS,
-            capstyle=tk.ROUND,
-            joinstyle=tk.ROUND,
-        )
-
-        # Positioning happens after the rest of the interface has been laid
-        # out because it depends on the SOURCE row and the playback time row.
-        # The container is shown/hidden with place()/place_forget().
+        self.cava_bars = []
+        for index in range(CAVA_BARS):
+            self.cava_bars.append(
+                self.visualizer_canvas.create_rectangle(
+                    0,
+                    VISUALIZER_HEIGHT,
+                    1,
+                    VISUALIZER_HEIGHT,
+                    fill=self.cava_colors[index],
+                    outline="",
+                )
+            )
 
         # ==============================================
         # BOTTOM
@@ -645,11 +632,10 @@ class SpotifyLight(tk.Tk):
             self.volume_drag_end,
         )
 
-        # Keep the full-width waveform correctly positioned when the window
-        # is resized or maximized.  after_idle lets Tk finish its first layout
-        # pass before we read widget coordinates.
-        self.bind("<Configure>", self.position_waveform)
-        self.after_idle(self.position_waveform)
+        # Keep the full-width visualizer correctly positioned when the window
+        # is resized or maximized. after_idle lets Tk finish its first layout.
+        self.bind("<Configure>", self.position_visualizer)
+        self.after_idle(self.position_visualizer)
 
     def detail_row(self, parent, label):
         row = tk.Frame(parent, bg=BG)
@@ -907,42 +893,54 @@ class SpotifyLight(tk.Tk):
         )
 
     # ==================================================
-    # LIGHTWEIGHT WAVEFORM
+    # CAVA VISUALIZER
     # ==================================================
 
-    def update_waveform_button(self):
-        if not self.waveform_available:
-            label = "LINE UNAVAILABLE"
+    def update_visualizer_button(self):
+        if not self.visualizer_available:
+            text = "VISUALIZER: CAVA MISSING"
         else:
-            label = (
-                "LINE ON"
-                if self.waveform_enabled
-                else "LINE OFF"
-            )
+            text = "VISUALIZER: ON" if self.visualizer_enabled else "VISUALIZER: OFF"
+        self.visualizer_button.config(text=text)
 
-        self.waveform_button.config(text=label)
-
-    def toggle_waveform(self):
-        self.waveform_enabled = not self.waveform_enabled
-
-        save_settings(
-            {
-                "waveform_enabled": self.waveform_enabled,
-            }
-        )
-
-        if self.waveform_enabled:
-            self.position_waveform()
-            self.start_waveform()
+    def toggle_visualizer(self):
+        if self.visualizer_enabled:
+            self.disable_visualizer()
         else:
-            self.stop_waveform()
-            self.waveform_container.place_forget()
+            self.enable_visualizer()
 
-        self.update_waveform_button()
+    def enable_visualizer(self):
+        cava = find_cava()
+        if not cava:
+            self.visualizer_available = False
+            self.visualizer_enabled = False
+            self.update_visualizer_button()
+            return
 
-    def position_waveform(self, event=None):
-        """Place the waveform across the app in the SOURCE-to-time gap."""
-        if not self.waveform_enabled:
+        self.visualizer_available = True
+        self.visualizer_enabled = True
+        self.position_visualizer()
+
+        if not self.start_cava(cava):
+            self.visualizer_enabled = False
+            self.visualizer_container.place_forget()
+            self.update_visualizer_button()
+            return
+
+        self.start_visualizer_draw()
+        self.update_visualizer_button()
+
+    def disable_visualizer(self):
+        self.visualizer_enabled = False
+        self.stop_visualizer_draw()
+        self.stop_cava()
+        self.visualizer_container.place_forget()
+        self.cava_values = [0.0] * CAVA_BARS
+        self.cava_display_values = [0.0] * CAVA_BARS
+        self.update_visualizer_button()
+
+    def position_visualizer(self, event=None):
+        if not self.visualizer_enabled:
             return
 
         try:
@@ -954,120 +952,104 @@ class SpotifyLight(tk.Tk):
             )
             time_top = self.position_label.winfo_rooty() - root_y
 
-            # Leave breathing room around both neighboring sections.
             gap_top = source_bottom + 18
             gap_bottom = time_top - 18
 
             if gap_bottom <= gap_top:
                 return
 
-            # The old waveform sat quite low in this gap.  Placing its center
-            # at 52% of the SOURCE-to-time space moves it roughly another 20%
-            # upward while keeping it clear of the metadata and controls.
             center_y = gap_top + (gap_bottom - gap_top) * 0.52
-
-            # Keep the line field tall enough to breathe, but shrink on a
-            # shorter window so it stays clear of SOURCE and the time bar.
             available_height = max(44, int(gap_bottom - gap_top))
-            actual_height = min(WAVEFORM_HEIGHT, available_height)
+            actual_height = min(VISUALIZER_HEIGHT, available_height)
             y = int(center_y - actual_height / 2)
 
-            # Match the progress bar's 34 px outer margins so the waveform
-            # visually spans the full usable width of the window.
             margin = 34
             width = max(2, self.winfo_width() - margin * 2)
 
-            self.waveform_container.place(
+            self.visualizer_container.place(
                 x=margin,
                 y=y,
                 width=width,
                 height=actual_height,
             )
-            self.waveform_container.lift()
+            self.visualizer_container.lift()
 
         except tk.TclError:
             pass
 
-    def get_monitor_source(self):
-        pactl = shutil.which("pactl")
+    def write_cava_config(self):
+        os.makedirs(CAVA_CONFIG_DIR, exist_ok=True)
 
-        if not pactl:
-            return ""
+        # PulseAudio mode also works through pipewire-pulse on modern Linux and
+        # matches the monitor-source path Spotify Light previously used via parec.
+        config = f"""[general]
+framerate = 30
+autosens = 2
+bars = {CAVA_BARS}
+scaling = linear
+lower_cutoff_freq = 50
+higher_cutoff_freq = 10000
+sleep_timer = 1
 
-        sink = run_command(
-            [pactl, "get-default-sink"],
-            timeout=2,
-        )
+[input]
+method = pulse
+source = auto
 
-        if not sink:
-            info = run_command([pactl, "info"], timeout=2)
-            for line in info.splitlines():
-                if line.startswith("Default Sink:"):
-                    sink = line.split(":", 1)[1].strip()
-                    break
+[output]
+method = raw
+channels = mono
+mono_option = average
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = {CAVA_ASCII_MAX}
+bar_delimiter = 59
+frame_delimiter = 10
 
-        if not sink:
-            return ""
+[smoothing]
+monstercat = 0
+waves = 0
+noise_reduction = 65
+"""
 
-        if sink.endswith(".monitor"):
-            return sink
+        with open(CAVA_CONFIG_FILE, "w", encoding="utf-8") as handle:
+            handle.write(config)
 
-        return f"{sink}.monitor"
-
-    def start_waveform(self):
-        if not self.waveform_enabled:
-            return
-
-        if self.waveform_process and self.waveform_process.poll() is None:
-            return
-
-        parec = shutil.which("parec")
-        monitor = self.get_monitor_source()
-
-        if not parec or not monitor:
-            self.waveform_available = False
-            self.update_waveform_button()
-            return
-
-        self.waveform_available = True
-        self.waveform_monitor = monitor
-        self.waveform_stop.clear()
+    def start_cava(self, executable):
+        self.stop_cava()
 
         try:
-            self.waveform_process = subprocess.Popen(
-                [
-                    parec,
-                    "--raw",
-                    f"--device={monitor}",
-                    "--format=s16le",
-                    f"--rate={WAVEFORM_SAMPLE_RATE}",
-                    "--channels=1",
-                    "--latency-msec=25",
-                    "--process-time-msec=20",
-                ],
+            self.write_cava_config()
+            self.cava_stop.clear()
+            self.cava_process = subprocess.Popen(
+                [executable, "-p", CAVA_CONFIG_FILE],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                bufsize=0,
+                text=True,
+                bufsize=1,
             )
-
         except Exception:
-            self.waveform_process = None
-            self.waveform_available = False
-            self.update_waveform_button()
-            return
+            self.cava_process = None
+            self.visualizer_available = False
+            return False
 
-        self.waveform_thread = threading.Thread(
-            target=self.waveform_capture_loop,
+        # Fail cleanly if CAVA cannot start with this build/config.
+        time.sleep(0.08)
+        if self.cava_process.poll() is not None:
+            self.cava_process = None
+            self.visualizer_available = False
+            return False
+
+        self.cava_thread = threading.Thread(
+            target=self.cava_reader_loop,
             daemon=True,
         )
-        self.waveform_thread.start()
-        self.update_waveform_button()
+        self.cava_thread.start()
+        return True
 
-    def stop_waveform(self):
-        self.waveform_stop.set()
-
-        process = self.waveform_process
-        self.waveform_process = None
+    def stop_cava(self):
+        self.cava_stop.set()
+        process = self.cava_process
+        self.cava_process = None
 
         if process:
             try:
@@ -1080,176 +1062,98 @@ class SpotifyLight(tk.Tk):
             except Exception:
                 pass
 
-        self.waveform_values = [0.0] * WAVEFORM_POINTS
-
-    def waveform_capture_loop(self):
-        process = self.waveform_process
-
+    def cava_reader_loop(self):
+        process = self.cava_process
         if not process or not process.stdout:
             return
 
-        previous = list(self.waveform_values)
-        display_gain = 1.0
-
         try:
-            while not self.waveform_stop.is_set():
-                data = process.stdout.read(WAVEFORM_READ_BYTES)
-
-                if not data:
+            for line in process.stdout:
+                if self.cava_stop.is_set():
                     break
 
-                samples = array.array("h")
-                samples.frombytes(data)
-
-                if sys.byteorder != "little":
-                    samples.byteswap()
-
-                if not samples:
+                parts = [part for part in line.strip().split(";") if part]
+                if not parts:
                     continue
 
-                sample_count = len(samples)
-                segment = max(1, sample_count // WAVEFORM_POINTS)
-
-                chunk_peak = max(abs(sample) for sample in samples)
-                mean_square = (
-                    sum(sample * sample for sample in samples)
-                    / sample_count
-                )
-                chunk_rms = math.sqrt(mean_square)
-
-                # Stable automatic gain keeps quieter music visible while
-                # avoiding hard jumps on loud hits. Gain rises slowly and
-                # falls faster so the line stays reactive without pumping.
-                measured_level = max(
-                    850.0,
-                    chunk_rms * 2.0,
-                    chunk_peak * 0.34,
-                )
-                target_gain = max(
-                    1.0,
-                    min(6.5, 17000.0 / measured_level),
-                )
-
-                if target_gain < display_gain:
-                    display_gain = (
-                        display_gain * 0.64
-                        + target_gain * 0.36
-                    )
-                else:
-                    display_gain = (
-                        display_gain * 0.91
-                        + target_gain * 0.09
-                    )
-
                 values = []
+                for part in parts[:CAVA_BARS]:
+                    try:
+                        value = float(part) / CAVA_ASCII_MAX
+                    except ValueError:
+                        value = 0.0
+                    values.append(max(0.0, min(1.0, value)))
 
-                for index in range(WAVEFORM_POINTS):
-                    start = index * segment
-                    end = min(sample_count, start + segment)
+                if len(values) < CAVA_BARS:
+                    values.extend([0.0] * (CAVA_BARS - len(values)))
 
-                    if start >= sample_count:
-                        values.append(0.0)
-                        continue
-
-                    piece = samples[start:end]
-
-                    if not piece:
-                        values.append(0.0)
-                        continue
-
-                    representative = max(
-                        piece,
-                        key=lambda sample: abs(sample),
-                    )
-
-                    raw_value = (
-                        representative
-                        / 32768.0
-                        * display_gain
-                    )
-
-                    # Soft limiting preserves large peaks without the ugly flat
-                    # tops that hard clipping would create.
-                    value = math.tanh(raw_value * 1.18)
-
-                    # Slightly slower than the earlier almost-live version:
-                    # only 28% of each new chunk enters per update.
-                    smoothed = (
-                        previous[index] * 0.72
-                        + value * 0.28
-                    )
-                    values.append(smoothed)
-
-                # Neighbor smoothing creates broader flowing shapes while still
-                # representing the current audio, rather than a synthetic wave.
-                if len(values) >= 5:
-                    for _pass in range(2):
-                        spatial = values[:]
-                        for index in range(2, len(values) - 2):
-                            spatial[index] = (
-                                values[index - 2]
-                                + values[index - 1] * 2
-                                + values[index] * 3
-                                + values[index + 1] * 2
-                                + values[index + 2]
-                            ) / 9
-                        values = spatial
-
-                previous = values
-                self.waveform_values = values
-                self.waveform_last_audio = time.monotonic()
+                self.cava_values = values
 
         except Exception:
             pass
 
-    def draw_waveform(self):
-        if self.waveform_enabled:
-            width = max(2, self.waveform_canvas.winfo_width())
-            height = max(2, self.waveform_canvas.winfo_height())
-            center = height / 2
+    def start_visualizer_draw(self):
+        if self.visualizer_draw_after is None and self.visualizer_enabled:
+            self.draw_visualizer()
 
-            # Faint x-axis / zero line.
-            self.waveform_canvas.coords(
-                self.waveform_center,
-                0,
-                center,
-                width,
-                center,
+    def stop_visualizer_draw(self):
+        if self.visualizer_draw_after is not None:
+            try:
+                self.after_cancel(self.visualizer_draw_after)
+            except Exception:
+                pass
+            self.visualizer_draw_after = None
+
+    def draw_visualizer(self):
+        if not self.visualizer_enabled:
+            self.visualizer_draw_after = None
+            return
+
+        width = max(2, self.visualizer_canvas.winfo_width())
+        height = max(2, self.visualizer_canvas.winfo_height())
+        slot = width / CAVA_BARS
+        bar_width = max(2.0, slot * 0.62)
+        max_height = max(8.0, height - 8.0)
+
+        target = self.cava_values
+        display = []
+
+        for index in range(CAVA_BARS):
+            current = self.cava_display_values[index]
+            next_value = target[index]
+
+            # CAVA already smooths the signal. This tiny UI interpolation only
+            # prevents visible stepping between raw-output frames.
+            if next_value >= current:
+                value = current * 0.20 + next_value * 0.80
+            else:
+                value = current * 0.55 + next_value * 0.45
+            display.append(value)
+
+            x = slot * index + slot / 2
+            bar_height = max(2.0, value * max_height)
+            self.visualizer_canvas.coords(
+                self.cava_bars[index],
+                x - bar_width / 2,
+                height - bar_height,
+                x + bar_width / 2,
+                height,
             )
 
-            values = self.waveform_values
+        self.cava_display_values = display
 
-            # If capture goes stale, ease the existing line back to zero rather
-            # than snapping it flat.
-            if time.monotonic() - self.waveform_last_audio > 0.15:
-                values = [value * 0.94 for value in values]
-                self.waveform_values = values
+        # If CAVA unexpectedly exits while ON, return to the true low-power OFF state.
+        if self.cava_process and self.cava_process.poll() is not None:
+            self.visualizer_enabled = False
+            self.visualizer_available = False
+            self.visualizer_container.place_forget()
+            self.visualizer_draw_after = None
+            self.update_visualizer_button()
+            return
 
-            if values:
-                step = width / max(1, len(values) - 1)
-
-                # Preserve the more dramatic amplitude from the recent version:
-                # peaks can use almost the full half-height on either side of zero.
-                amplitude = max(14, (height / 2) - 8)
-                coords = []
-
-                for index, value in enumerate(values):
-                    x = index * step
-                    y = center - (value * amplitude)
-                    coords.extend([x, y])
-
-                self.waveform_canvas.coords(
-                    self.waveform_glow,
-                    *coords,
-                )
-                self.waveform_canvas.coords(
-                    self.waveform_line,
-                    *coords,
-                )
-
-        self.after(
-            WAVEFORM_REFRESH_MS,
-            self.draw_waveform,
+        self.visualizer_draw_after = self.after(
+            VISUALIZER_REFRESH_MS,
+            self.draw_visualizer,
         )
 
     # ==================================================
@@ -1343,7 +1247,8 @@ class SpotifyLight(tk.Tk):
     # ==================================================
 
     def close_app(self):
-        self.stop_waveform()
+        self.stop_visualizer_draw()
+        self.stop_cava()
         self.stop_spotifyd()
         self.destroy()
 
