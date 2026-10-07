@@ -334,6 +334,13 @@ class SpotifyLight(tk.Tk):
         self.cava_values = [0.0] * CAVA_BARS
         self.cava_display_values = [0.0] * CAVA_BARS
 
+        # While the visualizer is ON, keep the display awake and inhibit
+        # system sleep. Everything is released again when the visualizer is
+        # turned OFF or Spotify Light closes.
+        self.sleep_inhibit_process = None
+        self.screensaver_suspended = False
+        self.screensaver_window_id = None
+
         # Precompute every palette once. The dropdown therefore adds virtually
         # no runtime cost, even while CAVA is drawing at full speed.
         self.cava_palette_cache = {
@@ -1120,6 +1127,7 @@ class SpotifyLight(tk.Tk):
             self.update_visualizer_button()
             return
 
+        self.start_activity_inhibit()
         self.start_visualizer_draw()
         self.update_visualizer_button()
 
@@ -1127,10 +1135,95 @@ class SpotifyLight(tk.Tk):
         self.visualizer_enabled = False
         self.stop_visualizer_draw()
         self.stop_cava()
+        self.stop_activity_inhibit()
         self.visualizer_container.place_forget()
         self.cava_values = [0.0] * CAVA_BARS
         self.cava_display_values = [0.0] * CAVA_BARS
         self.update_visualizer_button()
+
+    def start_activity_inhibit(self):
+        """Prevent screen blanking and sleep while the visualizer is active."""
+        self.stop_activity_inhibit()
+
+        # xdg-screensaver handles the desktop screensaver / DPMS path and is
+        # paired with an explicit resume using this exact window ID.
+        xdg_screensaver = shutil.which("xdg-screensaver")
+        if xdg_screensaver:
+            try:
+                self.update_idletasks()
+                window_id = f"0x{self.winfo_id():x}"
+                result = subprocess.run(
+                    [xdg_screensaver, "suspend", window_id],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    self.screensaver_suspended = True
+                    self.screensaver_window_id = window_id
+            except Exception:
+                self.screensaver_suspended = False
+                self.screensaver_window_id = None
+
+        # systemd-inhibit remains alive only while this child process exists.
+        # Blocking idle + sleep prevents automatic suspend while visualizing.
+        inhibitor = shutil.which("systemd-inhibit")
+        sleeper = shutil.which("sleep")
+        if inhibitor and sleeper:
+            try:
+                self.sleep_inhibit_process = subprocess.Popen(
+                    [
+                        inhibitor,
+                        "--what=idle:sleep",
+                        "--who=Spotify Light",
+                        "--why=Audio visualizer is active",
+                        "--mode=block",
+                        sleeper,
+                        "infinity",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                self.sleep_inhibit_process = None
+
+    def stop_activity_inhibit(self):
+        """Restore normal screensaver and sleep behavior."""
+        process = self.sleep_inhibit_process
+        self.sleep_inhibit_process = None
+
+        if process:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+            except Exception:
+                pass
+
+        if self.screensaver_suspended and self.screensaver_window_id:
+            xdg_screensaver = shutil.which("xdg-screensaver")
+            if xdg_screensaver:
+                try:
+                    subprocess.run(
+                        [
+                            xdg_screensaver,
+                            "resume",
+                            self.screensaver_window_id,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                        check=False,
+                    )
+                except Exception:
+                    pass
+
+        self.screensaver_suspended = False
+        self.screensaver_window_id = None
 
     def position_visualizer(self, event=None):
         if not self.visualizer_enabled:
@@ -1453,6 +1546,7 @@ noise_reduction = 65
     def close_app(self):
         self.stop_visualizer_draw()
         self.stop_cava()
+        self.stop_activity_inhibit()
         self.stop_spotifyd()
         self.destroy()
 
