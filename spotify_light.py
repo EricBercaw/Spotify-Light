@@ -43,10 +43,13 @@ VISUALIZER_REFRESH_MS = 33     # ~30 FPS only while CAVA is enabled
 CAVA_BARS = 34
 CAVA_ASCII_MAX = 1000
 
-# Seven lightweight three-stop color schemes. Each scheme keeps a subtle
-# gradient across the bars; changing schemes only swaps precomputed colors and
-# does not restart CAVA or add any audio-processing work.
+# Seven lightweight three-stop color schemes plus an eighth Dynamic option.
+# Every scheme keeps a subtle gradient across the bars. Dynamic smoothly blends
+# from one full gradient to the next over 10 seconds, then continues cycling.
 DEFAULT_COLOR_SCHEME = "Violet → Magenta"
+DYNAMIC_COLOR_SCHEME = "Dynamic"
+DYNAMIC_TRANSITION_SECONDS = 10.0
+DYNAMIC_COLOR_REFRESH_SECONDS = 0.10
 COLOR_SCHEMES = {
     "Violet → Magenta": ("#4c1d95", "#7c3aed", "#c026d3"),
     "Deep Blue → Cyan": ("#1e3a8a", "#2563eb", "#06b6d4"),
@@ -339,6 +342,8 @@ class SpotifyLight(tk.Tk):
         }
         self.color_scheme_name = DEFAULT_COLOR_SCHEME
         self.cava_colors = self.cava_palette_cache[self.color_scheme_name]
+        self.dynamic_color_start = time.monotonic()
+        self.dynamic_color_last_update = 0.0
 
         self.protocol("WM_DELETE_WINDOW", self.close_app)
 
@@ -406,7 +411,8 @@ class SpotifyLight(tk.Tk):
         self.color_menu = tk.OptionMenu(
             top_right,
             self.color_scheme_var,
-            *COLOR_SCHEMES.keys(),
+            *list(COLOR_SCHEMES.keys()),
+            DYNAMIC_COLOR_SCHEME,
             command=self.apply_color_scheme,
         )
         self.color_menu.config(
@@ -1010,12 +1016,23 @@ class SpotifyLight(tk.Tk):
     # ==================================================
 
     def apply_color_scheme(self, scheme_name=None):
-        if scheme_name not in self.cava_palette_cache:
+        valid_names = set(self.cava_palette_cache) | {DYNAMIC_COLOR_SCHEME}
+        if scheme_name not in valid_names:
             scheme_name = DEFAULT_COLOR_SCHEME
 
         self.color_scheme_name = scheme_name
         self.color_scheme_var.set(scheme_name)
-        self.cava_colors = self.cava_palette_cache[scheme_name]
+
+        if scheme_name == DYNAMIC_COLOR_SCHEME:
+            # Start each Dynamic session from the default gradient, then blend
+            # continuously through all seven palettes in menu order.
+            self.dynamic_color_start = time.monotonic()
+            self.dynamic_color_last_update = 0.0
+            self.cava_colors = list(
+                self.cava_palette_cache[DEFAULT_COLOR_SCHEME]
+            )
+        else:
+            self.cava_colors = self.cava_palette_cache[scheme_name]
 
         # Update the existing canvas rectangles in place. This works whether
         # the visualizer is on or off and never requires a CAVA restart.
@@ -1023,6 +1040,43 @@ class SpotifyLight(tk.Tk):
             self.visualizer_canvas.itemconfig(
                 bar,
                 fill=self.cava_colors[index],
+            )
+
+    def update_dynamic_colors(self, now=None):
+        if self.color_scheme_name != DYNAMIC_COLOR_SCHEME:
+            return
+
+        if now is None:
+            now = time.monotonic()
+
+        # Color changes are intentionally capped at 10 Hz. The transition still
+        # looks smooth over a 10-second blend while keeping UI work negligible.
+        if now - self.dynamic_color_last_update < DYNAMIC_COLOR_REFRESH_SECONDS:
+            return
+
+        self.dynamic_color_last_update = now
+        palette_names = list(COLOR_SCHEMES.keys())
+        elapsed = max(0.0, now - self.dynamic_color_start)
+        stage = int(elapsed // DYNAMIC_TRANSITION_SECONDS)
+        blend = (elapsed % DYNAMIC_TRANSITION_SECONDS) / DYNAMIC_TRANSITION_SECONDS
+
+        current_name = palette_names[stage % len(palette_names)]
+        next_name = palette_names[(stage + 1) % len(palette_names)]
+        current_palette = self.cava_palette_cache[current_name]
+        next_palette = self.cava_palette_cache[next_name]
+
+        colors = [
+            lerp_color(current_palette[index], next_palette[index], blend)
+            for index in range(CAVA_BARS)
+        ]
+        self.cava_colors = colors
+
+        # Blend each corresponding bar color, so the left-to-right gradient is
+        # preserved throughout the entire transition rather than fading flat.
+        for index, bar in enumerate(self.cava_bars):
+            self.visualizer_canvas.itemconfig(
+                bar,
+                fill=colors[index],
             )
 
     def update_visualizer_button(self):
@@ -1048,6 +1102,16 @@ class SpotifyLight(tk.Tk):
 
         self.visualizer_available = True
         self.visualizer_enabled = True
+
+        if self.color_scheme_name == DYNAMIC_COLOR_SCHEME:
+            # Dynamic timing begins when the visualizer actually turns on, so
+            # time spent in the true low-power OFF state does not advance it.
+            self.dynamic_color_start = time.monotonic()
+            self.dynamic_color_last_update = 0.0
+            self.cava_colors = list(
+                self.cava_palette_cache[DEFAULT_COLOR_SCHEME]
+            )
+
         self.position_visualizer()
 
         if not self.start_cava(cava):
@@ -1246,6 +1310,8 @@ noise_reduction = 65
         if not self.visualizer_enabled:
             self.visualizer_draw_after = None
             return
+
+        self.update_dynamic_colors()
 
         width = max(2, self.visualizer_canvas.winfo_width())
         height = max(2, self.visualizer_canvas.winfo_height())
