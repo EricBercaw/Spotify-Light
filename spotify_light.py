@@ -36,6 +36,9 @@ PROGRESS_REFRESH_MS = 200
 # CAVA-backed visualizer. OFF is always the startup/base-case mode.
 # When OFF there is no CAVA process, no audio analysis, and no redraw loop.
 VISUALIZER_HEIGHT = 162
+VISUALIZER_MAX_HEIGHT = 360
+WINDOWED_HEIGHT = 625
+VISUALIZER_GROWTH_PER_PX = 0.35
 VISUALIZER_REFRESH_MS = 33     # ~30 FPS only while CAVA is enabled
 CAVA_BARS = 34
 CAVA_ASCII_MAX = 1000
@@ -282,6 +285,11 @@ class SpotifyLight(tk.Tk):
         self.minsize(850, 560)
         self.configure(bg=BG)
 
+        # True fullscreen is user-controlled and never forced at startup.
+        self.fullscreen = False
+        self.bind("<F11>", self.toggle_fullscreen)
+        self.bind("<Escape>", self.exit_fullscreen)
+
         self.spotifyd_process = None
         self.started_spotifyd = False
         self.player = None
@@ -370,6 +378,27 @@ class SpotifyLight(tk.Tk):
             side="left",
             padx=(16, 0),
         )
+
+        self.fullscreen_button = tk.Button(
+            top_right,
+            text="FULLSCREEN",
+            command=self.toggle_fullscreen,
+            bg=BG,
+            fg=MUTED,
+            activebackground=BG,
+            activeforeground=TEXT,
+            relief="flat",
+            bd=0,
+            padx=0,
+            pady=0,
+            cursor="hand2",
+            font=("Sans", 9, "bold"),
+        )
+        self.fullscreen_button.pack(
+            side="left",
+            padx=(16, 0),
+        )
+        self.update_fullscreen_button()
 
         body = tk.Frame(self, bg=BG)
         body.pack(
@@ -893,6 +922,34 @@ class SpotifyLight(tk.Tk):
         )
 
     # ==================================================
+    # FULLSCREEN
+    # ==================================================
+
+    def update_fullscreen_button(self):
+        self.fullscreen_button.config(
+            text="EXIT FULLSCREEN" if self.fullscreen else "FULLSCREEN"
+        )
+
+    def toggle_fullscreen(self, event=None):
+        self.fullscreen = not self.fullscreen
+        self.attributes("-fullscreen", self.fullscreen)
+        self.update_fullscreen_button()
+
+        # Recalculate the visualizer geometry after Tk/LXQt has finished
+        # applying the new screen dimensions.
+        self.after(80, self.position_visualizer)
+        return "break" if event is not None else None
+
+    def exit_fullscreen(self, event=None):
+        if self.fullscreen:
+            self.fullscreen = False
+            self.attributes("-fullscreen", False)
+            self.update_fullscreen_button()
+            self.after(80, self.position_visualizer)
+
+        return "break" if event is not None else None
+
+    # ==================================================
     # CAVA VISUALIZER
     # ==================================================
 
@@ -960,7 +1017,16 @@ class SpotifyLight(tk.Tk):
 
             center_y = gap_top + (gap_bottom - gap_top) * 0.52
             available_height = max(44, int(gap_bottom - gap_top))
-            actual_height = min(VISUALIZER_HEIGHT, available_height)
+
+            # Preserve the exact compact-window look, but let the CAVA area
+            # grow vertically as the window gets taller. At the default 625 px
+            # window height this remains 162 px; fullscreen can grow to 360 px.
+            extra_window_height = max(0, self.winfo_height() - WINDOWED_HEIGHT)
+            desired_height = VISUALIZER_HEIGHT + int(
+                extra_window_height * VISUALIZER_GROWTH_PER_PX
+            )
+            desired_height = min(VISUALIZER_MAX_HEIGHT, desired_height)
+            actual_height = min(desired_height, available_height)
             y = int(center_y - actual_height / 2)
 
             margin = 34
